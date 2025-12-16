@@ -1,5 +1,11 @@
 const crypto = require("crypto");
-const { BlacklistAllianceError } = require("./errors");
+const {
+	BlacklistAllianceError,
+	ValidationError,
+	TimeoutError,
+	NetworkError,
+	CircuitBreakerError,
+} = require("./errors");
 
 const BASE_URL = "https://api.blacklistalliance.net";
 
@@ -112,6 +118,24 @@ class BlacklistAlliance {
 		this.timeout = options.timeout || 30000;
 		this.retries = options.retries ?? 3;
 		this.logger = options.logger || null;
+		this.dryRun = options.dryRun || false;
+
+		// Request/response hooks
+		this.onRequest = options.onRequest || null;
+		this.onResponse = options.onResponse || null;
+
+		// Circuit breaker configuration
+		this._circuitBreaker = options.circuitBreaker
+			? {
+					enabled: true,
+					failureThreshold: options.circuitBreaker.failureThreshold || 5,
+					resetTimeoutMs: options.circuitBreaker.resetTimeoutMs || 30000,
+					state: "CLOSED", // CLOSED, OPEN, HALF_OPEN
+					failures: 0,
+					lastFailureTime: null,
+					onStateChange: options.circuitBreaker.onStateChange || null,
+				}
+			: { enabled: false };
 	}
 
 	/**
@@ -133,10 +157,104 @@ class BlacklistAlliance {
 	}
 
 	/**
+	 * Check circuit breaker state and transition if needed
+	 * @private
+	 */
+	_checkCircuitBreaker() {
+		if (!this._circuitBreaker.enabled) return;
+
+		const cb = this._circuitBreaker;
+		const now = Date.now();
+
+		// OPEN → HALF_OPEN (after cooldown)
+		if (cb.state === 'OPEN' && cb.lastFailureTime) {
+			if (now - cb.lastFailureTime >= cb.resetTimeoutMs) {
+				this._changeCircuitState('HALF_OPEN');
+			}
+		}
+
+		// Block requests if OPEN
+		if (cb.state === 'OPEN') {
+			throw new CircuitBreakerError(
+				`Circuit breaker is OPEN. Service unavailable. Will retry after ${cb.resetTimeoutMs}ms cooldown.`
+			);
+		}
+	}
+
+	/**
+	 * Record successful request
+	 * @private
+	 */
+	_recordSuccess() {
+		if (!this._circuitBreaker.enabled) return;
+
+		const cb = this._circuitBreaker;
+
+		// HALF_OPEN → CLOSED on success
+		if (cb.state === 'HALF_OPEN') {
+			cb.failures = 0;
+			this._changeCircuitState('CLOSED');
+		} else if (cb.state === 'CLOSED') {
+			// Reset failure count on success
+			cb.failures = 0;
+		}
+	}
+
+	/**
+	 * Record failed request
+	 * @private
+	 */
+	_recordFailure() {
+		if (!this._circuitBreaker.enabled) return;
+
+		const cb = this._circuitBreaker;
+		cb.failures++;
+		cb.lastFailureTime = Date.now();
+
+		this._log('warn', 'Circuit breaker failure recorded', {
+			failures: cb.failures,
+			threshold: cb.failureThreshold,
+			state: cb.state
+		});
+
+		// CLOSED → OPEN (threshold reached)
+		if (cb.state === 'CLOSED' && cb.failures >= cb.failureThreshold) {
+			this._changeCircuitState('OPEN');
+		}
+
+		// HALF_OPEN → OPEN (failure during test)
+		if (cb.state === 'HALF_OPEN') {
+			this._changeCircuitState('OPEN');
+		}
+	}
+
+	/**
+	 * Change circuit breaker state
+	 * @private
+	 */
+	_changeCircuitState(newState) {
+		const oldState = this._circuitBreaker.state;
+		this._circuitBreaker.state = newState;
+
+		this._log('warn', `Circuit breaker: ${oldState} → ${newState}`, {
+			failures: this._circuitBreaker.failures,
+			threshold: this._circuitBreaker.failureThreshold
+		});
+
+		if (this._circuitBreaker.onStateChange) {
+			this._circuitBreaker.onStateChange(newState);
+		}
+	}
+
+	/**
 	 * Check if error is retryable (5xx, network errors, timeouts)
 	 * @private
 	 */
 	_isRetryable(error) {
+		// Retry on NetworkError and TimeoutError
+		if (error instanceof NetworkError || error instanceof TimeoutError) {
+			return true;
+		}
 		if (error instanceof BlacklistAllianceError) {
 			const status = error.statusCode;
 			// Retry on 5xx server errors, 408 timeout, 429 rate limit
@@ -165,10 +283,35 @@ class BlacklistAlliance {
 	 * @private
 	 */
 	_hashEmail(email) {
-		return crypto
-			.createHash("md5")
-			.update(email.toLowerCase().trim())
-			.digest("hex");
+		// Sanitize: cast to string, trim whitespace and newlines
+		const sanitized = String(email).replace(/[\r\n]/g, "").toLowerCase().trim();
+		return crypto.createHash("md5").update(sanitized).digest("hex");
+	}
+
+	/**
+	 * Validate email format (basic check)
+	 * @private
+	 */
+	_validateEmail(email) {
+		// Sanitize: cast to string, trim whitespace and newlines
+		const sanitized = String(email).replace(/[\r\n]/g, "").trim();
+		// Basic email regex - covers most valid emails without being overly strict
+		const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+		if (!emailRegex.test(sanitized)) {
+			throw new ValidationError(
+				`Invalid email format: ${email}`,
+				422,
+				null
+			);
+		}
+		if (sanitized.length > 254) {
+			throw new ValidationError(
+				`Email too long: ${email}. Max 254 characters.`,
+				422,
+				null
+			);
+		}
+		return sanitized;
 	}
 
 	/**
@@ -178,7 +321,7 @@ class BlacklistAlliance {
 	_validatePhone(phone) {
 		const cleaned = String(phone).replace(/\D/g, "");
 		if (cleaned.length < 10 || cleaned.length > 11) {
-			throw new BlacklistAllianceError(
+			throw new ValidationError(
 				`Invalid phone number: ${phone}. Expected 10-11 digits.`,
 				422,
 				null
@@ -188,15 +331,83 @@ class BlacklistAlliance {
 	}
 
 	/**
-	 * Make an HTTP request with timeout and retry logic
+	 * Generate mock response for dry run mode
 	 * @private
 	 */
+	_getDryRunResponse(url, options) {
+		// Determine response type based on URL
+		if (url.includes("/lookup") && !url.includes("bulk")) {
+			return {
+				sid: "dry-run",
+				status: "success",
+				message: "Clean",
+				code: "",
+				offset: 0,
+				wireless: 0,
+				phone: "0000000000",
+				results: 1,
+				time: 0,
+				scrubs: "",
+			};
+		}
+		if (url.includes("bulk") || url.includes("bulklookup")) {
+			const body = options.body ? JSON.parse(options.body) : {};
+			const phones = body.phones || [];
+			return {
+				status: "success",
+				numbers: phones.length,
+				count: phones.length,
+				phones: phones,
+				supression: [],
+				wireless: [],
+				reasons: {},
+				carrier: {},
+			};
+		}
+		if (url.includes("emailbulk")) {
+			const body = options.body ? JSON.parse(options.body) : {};
+			const emails = body.emails || [];
+			return {
+				good: emails,
+				bad: [],
+			};
+		}
+		return { status: "success", dryRun: true };
+	}
+
+	/**
+	 * Make an HTTP request with timeout and retry logic
+	 * @private
+	 * @param {string} url
+	 * @param {Object} options
+	 * @param {AbortSignal} [options.signal] - External abort signal for cancellation
+	 */
 	async _request(url, options = {}) {
+		// Dry run mode - return mock data without making API call
+		if (this.dryRun) {
+			this._log("debug", "Dry run - skipping actual request", { url });
+			return this._getDryRunResponse(url, options);
+		}
+
+		// Check circuit breaker
+		this._checkCircuitBreaker();
+
+		const externalSignal = options.signal;
+
+		// Check if already aborted before starting
+		if (externalSignal?.aborted) {
+			throw new TimeoutError("Request aborted", null);
+		}
+
 		let lastError;
 
 		for (let attempt = 0; attempt <= this.retries; attempt++) {
 			const controller = new AbortController();
 			const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+			// Link external signal to our controller
+			const onExternalAbort = () => controller.abort();
+			externalSignal?.addEventListener("abort", onExternalAbort);
 
 			try {
 				if (attempt > 0) {
@@ -211,10 +422,24 @@ class BlacklistAlliance {
 					await this._sleep(jitter);
 				}
 
+				// Check again if aborted during backoff
+				if (externalSignal?.aborted) {
+					throw new TimeoutError("Request aborted", null);
+				}
+
 				this._log("debug", "Request started", {
 					url,
 					method: options.method || "GET",
 				});
+
+				// Call onRequest hook
+				if (this.onRequest) {
+					await this.onRequest(url, {
+						method: options.method || "GET",
+						headers: options.headers,
+						body: options.body,
+					});
+				}
 
 				const response = await fetch(url, {
 					...options,
@@ -227,6 +452,7 @@ class BlacklistAlliance {
 				});
 
 				clearTimeout(timeoutId);
+				externalSignal?.removeEventListener("abort", onExternalAbort);
 
 				const contentType = response.headers.get("content-type");
 				let data;
@@ -238,10 +464,12 @@ class BlacklistAlliance {
 				}
 
 				if (!response.ok) {
-					const error = new BlacklistAllianceError(
+					const retryAfter = response.headers.get("retry-after");
+					const error = BlacklistAllianceError.fromResponse(
 						`API request failed: ${response.statusText}`,
 						response.status,
-						data
+						data,
+						{ retryAfter: retryAfter ? parseInt(retryAfter, 10) : undefined }
 					);
 
 					// Check if we should retry
@@ -257,12 +485,36 @@ class BlacklistAlliance {
 					url,
 					status: response.status,
 				});
+
+				// Call onResponse hook
+				if (this.onResponse) {
+					await this.onResponse(
+						{ status: response.status, headers: response.headers },
+						data
+					);
+				}
+
+				// Record success for circuit breaker
+				this._recordSuccess();
+
 				return data;
 			} catch (error) {
 				clearTimeout(timeoutId);
+				externalSignal?.removeEventListener("abort", onExternalAbort);
 
 				if (error.name === "AbortError") {
-					lastError = new BlacklistAllianceError("Request timeout", 408, null);
+					// Check if abort was from external signal or internal timeout
+					const wasExternalAbort = externalSignal?.aborted;
+					lastError = new TimeoutError(
+						wasExternalAbort ? "Request aborted" : "Request timeout",
+						null
+					);
+					// Don't retry if user explicitly aborted
+					if (wasExternalAbort) {
+						throw lastError;
+					}
+				} else if (error.code === "ECONNRESET" || error.code === "ENOTFOUND" || error.code === "ECONNREFUSED") {
+					lastError = new NetworkError(error.message, error);
 				} else {
 					lastError = error;
 				}
@@ -277,9 +529,16 @@ class BlacklistAlliance {
 				}
 
 				this._log("error", "Request failed", { url, error: lastError.message });
+
+				// Record failure for circuit breaker
+				this._recordFailure();
+
 				throw lastError;
 			}
 		}
+
+		// Record failure for circuit breaker (fallback if loop completes without throwing)
+		this._recordFailure();
 
 		throw lastError;
 	}
@@ -365,7 +624,7 @@ class BlacklistAlliance {
 			resp: options.responseFormat || "json",
 		});
 
-		return this._request(`${BASE_URL}/lookup?${params}`);
+		return this._request(`${BASE_URL}/lookup?${params}`, { signal: options.signal });
 	}
 
 	/**
@@ -383,7 +642,7 @@ class BlacklistAlliance {
 	 */
 	async bulkLookupSimple(phones, options = {}) {
 		if (!Array.isArray(phones) || phones.length === 0) {
-			throw new BlacklistAllianceError(
+			throw new ValidationError(
 				"phones must be a non-empty array",
 				400,
 				null
@@ -403,20 +662,32 @@ class BlacklistAlliance {
 		});
 
 		if (batches.length === 1) {
-			return this._request(`${BASE_URL}/bulklookup?${params}`, {
+			const result = await this._request(`${BASE_URL}/bulklookup?${params}`, {
 				method: "POST",
 				body: JSON.stringify({ phones: batches[0] }),
+				signal: options.signal,
 			});
+			if (options.onProgress) {
+				options.onProgress({ completed: phones.length, total: phones.length, batch: 1, totalBatches: 1 });
+			}
+			return result;
 		}
 
 		// Multiple batches - execute sequentially and merge (JSON only)
 		const results = [];
-		for (const batch of batches) {
+		let completed = 0;
+		for (let i = 0; i < batches.length; i++) {
+			const batch = batches[i];
 			const result = await this._request(`${BASE_URL}/bulklookup?${params}`, {
 				method: "POST",
 				body: JSON.stringify({ phones: batch }),
+				signal: options.signal,
 			});
 			results.push(result);
+			completed += batch.length;
+			if (options.onProgress) {
+				options.onProgress({ completed, total: phones.length, batch: i + 1, totalBatches: batches.length });
+			}
 		}
 
 		return this._mergeBulkResults(results);
@@ -442,15 +713,20 @@ class BlacklistAlliance {
 	 */
 	async emailBulk(emails, options = {}) {
 		if (!Array.isArray(emails) || emails.length === 0) {
-			throw new BlacklistAllianceError(
+			throw new ValidationError(
 				"emails must be a non-empty array",
 				400,
 				null
 			);
 		}
 
-		// Convert to MD5 if requested
+		// Validate emails unless disabled (skip validation for pre-hashed emails)
 		let processedEmails = emails;
+		if (options.validate !== false && !options.hashEmails) {
+			processedEmails = emails.map((email) => this._validateEmail(email));
+		}
+
+		// Convert to MD5 if requested
 		if (options.hashEmails) {
 			processedEmails = emails.map((email) => this._hashEmail(email));
 		}
@@ -465,20 +741,32 @@ class BlacklistAlliance {
 		});
 
 		if (batches.length === 1) {
-			return this._request(`${BASE_URL}/emailbulk?${params}`, {
+			const result = await this._request(`${BASE_URL}/emailbulk?${params}`, {
 				method: "POST",
 				body: JSON.stringify({ emails: batches[0] }),
+				signal: options.signal,
 			});
+			if (options.onProgress) {
+				options.onProgress({ completed: processedEmails.length, total: processedEmails.length, batch: 1, totalBatches: 1 });
+			}
+			return result;
 		}
 
 		// Multiple batches - execute sequentially and merge
 		const results = [];
-		for (const batch of batches) {
+		let completed = 0;
+		for (let i = 0; i < batches.length; i++) {
+			const batch = batches[i];
 			const result = await this._request(`${BASE_URL}/emailbulk?${params}`, {
 				method: "POST",
 				body: JSON.stringify({ emails: batch }),
+				signal: options.signal,
 			});
 			results.push(result);
+			completed += batch.length;
+			if (options.onProgress) {
+				options.onProgress({ completed, total: processedEmails.length, batch: i + 1, totalBatches: batches.length });
+			}
 		}
 
 		return this._mergeEmailResults(results);
@@ -509,7 +797,7 @@ class BlacklistAlliance {
 
 		const url = `${BASE_URL}/standard/api/${version}/Lookup/key/${this.apiKey}/phone/${cleanPhone}/response/${responseFormat}`;
 
-		return this._request(url);
+		return this._request(url, { signal: options.signal });
 	}
 
 	/**
@@ -528,7 +816,7 @@ class BlacklistAlliance {
 	 */
 	async bulkLookup(phones, options = {}) {
 		if (!Array.isArray(phones) || phones.length === 0) {
-			throw new BlacklistAllianceError(
+			throw new ValidationError(
 				"phones must be a non-empty array",
 				400,
 				null
@@ -542,20 +830,32 @@ class BlacklistAlliance {
 		const url = `${BASE_URL}/standard/api/${version}/bulklookup/key/${this.apiKey}`;
 
 		if (batches.length === 1) {
-			return this._request(url, {
+			const result = await this._request(url, {
 				method: "POST",
 				body: JSON.stringify({ phones: batches[0] }),
+				signal: options.signal,
 			});
+			if (options.onProgress) {
+				options.onProgress({ completed: phones.length, total: phones.length, batch: 1, totalBatches: 1 });
+			}
+			return result;
 		}
 
 		// Multiple batches - execute sequentially and merge
 		const results = [];
-		for (const batch of batches) {
+		let completed = 0;
+		for (let i = 0; i < batches.length; i++) {
+			const batch = batches[i];
 			const result = await this._request(url, {
 				method: "POST",
 				body: JSON.stringify({ phones: batch }),
+				signal: options.signal,
 			});
 			results.push(result);
+			completed += batch.length;
+			if (options.onProgress) {
+				options.onProgress({ completed, total: phones.length, batch: i + 1, totalBatches: batches.length });
+			}
 		}
 
 		return this._mergeBulkResults(results);
@@ -624,6 +924,35 @@ class BlacklistAlliance {
 	 */
 	hashEmail(email) {
 		return this._hashEmail(email);
+	}
+
+	/**
+	 * Check API connectivity (health check)
+	 * Makes a simple lookup request to verify the API is reachable and credentials are valid.
+	 * @returns {Promise<boolean>} True if API is reachable and responding
+	 *
+	 * @example
+	 * if (await client.ping()) {
+	 *   console.log('API is healthy');
+	 * }
+	 */
+	async ping() {
+		try {
+			// Use a simple lookup with a test phone number
+			await this.lookupSingle("0000000000", { validate: false });
+			return true;
+		} catch (error) {
+			// AuthenticationError means API is reachable but creds are bad
+			if (error.name === "AuthenticationError") {
+				return false;
+			}
+			// For other errors, API may still be reachable
+			// A "not found" or similar response still means API is up
+			if (error.statusCode && error.statusCode < 500) {
+				return true;
+			}
+			return false;
+		}
 	}
 }
 

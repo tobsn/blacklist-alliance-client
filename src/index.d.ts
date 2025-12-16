@@ -59,6 +59,41 @@ export interface Logger {
   error?(message: string, meta?: object): void;
 }
 
+/** Request info passed to onRequest hook */
+export interface RequestInfo {
+  method: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/** Response info passed to onResponse hook */
+export interface ResponseInfo {
+  status: number;
+  headers: Headers;
+}
+
+/** Progress info passed to onProgress callback */
+export interface ProgressInfo {
+  /** Number of items completed so far */
+  completed: number;
+  /** Total number of items */
+  total: number;
+  /** Current batch number (1-indexed) */
+  batch: number;
+  /** Total number of batches */
+  totalBatches: number;
+}
+
+/** Circuit breaker configuration */
+export interface CircuitBreakerOptions {
+  /** Number of consecutive failures before opening circuit. @default 5 */
+  failureThreshold?: number;
+  /** Milliseconds to wait before attempting HALF_OPEN. @default 30000 */
+  resetTimeoutMs?: number;
+  /** Callback when circuit state changes */
+  onStateChange?: (state: 'CLOSED' | 'OPEN' | 'HALF_OPEN') => void;
+}
+
 export interface ClientOptions {
   /** @default 'v5' */
   defaultVersion?: ApiVersion;
@@ -68,6 +103,14 @@ export interface ClientOptions {
   retries?: number;
   /** Logger instance (console, pino, winston compatible). @default null */
   logger?: Logger;
+  /** Enable dry run mode - returns mock data without making API calls. @default false */
+  dryRun?: boolean;
+  /** Hook called before each request */
+  onRequest?: (url: string, info: RequestInfo) => void | Promise<void>;
+  /** Hook called after each successful response */
+  onResponse?: (response: ResponseInfo, data: unknown) => void | Promise<void>;
+  /** Circuit breaker configuration. @default null */
+  circuitBreaker?: CircuitBreakerOptions;
 }
 
 export interface LookupOptionsJson {
@@ -77,12 +120,16 @@ export interface LookupOptionsJson {
   responseFormat?: 'json';
   /** Validate phone format before sending. @default true */
   validate?: boolean;
+  /** AbortSignal for cancelling the request */
+  signal?: AbortSignal;
 }
 
 export interface LookupOptionsRaw {
   version?: ApiVersion;
   responseFormat: 'raw';
   validate?: boolean;
+  /** AbortSignal for cancelling the request */
+  signal?: AbortSignal;
 }
 
 export type LookupOptions = LookupOptionsJson | LookupOptionsRaw;
@@ -91,12 +138,14 @@ export interface StandardLookupOptionsJson {
   version?: ApiVersion;
   responseFormat?: 'json';
   validate?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface StandardLookupOptionsRaw {
   version?: ApiVersion;
   responseFormat: 'raw' | 'xml';
   validate?: boolean;
+  signal?: AbortSignal;
 }
 
 export type StandardLookupOptions = StandardLookupOptionsJson | StandardLookupOptionsRaw;
@@ -108,6 +157,9 @@ export interface BulkOptionsJson {
   responseFormat?: 'json';
   /** Auto-split large payloads into batches. @default true */
   autoBatch?: boolean;
+  signal?: AbortSignal;
+  /** Progress callback for batch operations */
+  onProgress?: (info: ProgressInfo) => void;
 }
 
 export interface BulkOptionsPhonecode {
@@ -117,6 +169,9 @@ export interface BulkOptionsPhonecode {
   responseFormat: 'phonecode';
   /** Auto-batching is disabled for phonecode format. @default false */
   autoBatch?: boolean;
+  signal?: AbortSignal;
+  /** Progress callback for batch operations */
+  onProgress?: (info: ProgressInfo) => void;
 }
 
 export type BulkOptions = BulkOptionsJson | BulkOptionsPhonecode;
@@ -126,6 +181,9 @@ export interface StandardBulkOptions {
   version?: ApiVersion;
   /** Auto-split large payloads into batches. @default true */
   autoBatch?: boolean;
+  signal?: AbortSignal;
+  /** Progress callback for batch operations */
+  onProgress?: (info: ProgressInfo) => void;
 }
 
 export interface EmailBulkOptions {
@@ -133,6 +191,11 @@ export interface EmailBulkOptions {
   hashEmails?: boolean;
   /** Auto-split large payloads into batches. @default true */
   autoBatch?: boolean;
+  /** Validate email format before sending. @default true */
+  validate?: boolean;
+  signal?: AbortSignal;
+  /** Progress callback for batch operations */
+  onProgress?: (info: ProgressInfo) => void;
 }
 
 export interface EmailCheckOptions {
@@ -140,12 +203,67 @@ export interface EmailCheckOptions {
   hashEmail?: boolean;
 }
 
+/** Base error class for all Blacklist Alliance errors */
 export class BlacklistAllianceError extends Error {
   name: 'BlacklistAllianceError';
   statusCode: number;
   response: unknown;
 
   constructor(message: string, statusCode: number, response: unknown);
+
+  /** Factory method to create appropriate error subclass based on status code */
+  static fromResponse(
+    message: string,
+    statusCode: number,
+    response: unknown,
+    options?: { retryAfter?: number }
+  ): BlacklistAllianceError;
+}
+
+/** Authentication/authorization error (401, 403) */
+export class AuthenticationError extends BlacklistAllianceError {
+  name: 'AuthenticationError';
+}
+
+/** Rate limit exceeded (429) */
+export class RateLimitError extends BlacklistAllianceError {
+  name: 'RateLimitError';
+  /** Seconds to wait before retrying (if provided by API) */
+  retryAfter: number | null;
+
+  constructor(message: string, response: unknown, retryAfter?: number);
+}
+
+/** Validation error for invalid input (400, 422) */
+export class ValidationError extends BlacklistAllianceError {
+  name: 'ValidationError';
+}
+
+/** Request timeout (408 or AbortError) */
+export class TimeoutError extends BlacklistAllianceError {
+  name: 'TimeoutError';
+
+  constructor(message: string, response: unknown);
+}
+
+/** Network connectivity error */
+export class NetworkError extends BlacklistAllianceError {
+  name: 'NetworkError';
+  originalError: Error | null;
+
+  constructor(message: string, originalError?: Error);
+}
+
+/** Server error (5xx) */
+export class ServerError extends BlacklistAllianceError {
+  name: 'ServerError';
+}
+
+/** Circuit breaker is open - requests blocked */
+export class CircuitBreakerError extends BlacklistAllianceError {
+  name: 'CircuitBreakerError';
+
+  constructor(message: string);
 }
 
 export class BlacklistAlliance {
@@ -154,6 +272,7 @@ export class BlacklistAlliance {
   timeout: number;
   retries: number;
   logger: Logger | null;
+  dryRun: boolean;
 
   constructor(apiKey: string, options?: ClientOptions);
 
@@ -210,4 +329,10 @@ export class BlacklistAlliance {
    * Hash an email to MD5
    */
   hashEmail(email: string): string;
+
+  /**
+   * Check API connectivity (health check)
+   * Returns true if API is reachable and responding
+   */
+  ping(): Promise<boolean>;
 }

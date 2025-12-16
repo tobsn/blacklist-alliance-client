@@ -1,6 +1,16 @@
 const { describe, it, mock, beforeEach } = require('node:test');
 const assert = require('node:assert');
-const { BlacklistAlliance, BlacklistAllianceError } = require('../src');
+const {
+  BlacklistAlliance,
+  BlacklistAllianceError,
+  AuthenticationError,
+  RateLimitError,
+  ValidationError,
+  TimeoutError,
+  NetworkError,
+  ServerError,
+  CircuitBreakerError,
+} = require('../src');
 
 describe('BlacklistAlliance', () => {
   describe('constructor', () => {
@@ -72,6 +82,52 @@ describe('BlacklistAlliance', () => {
       const hash1 = client.hashEmail('  test@example.com  ');
       const hash2 = client.hashEmail('test@example.com');
       assert.strictEqual(hash1, hash2);
+    });
+  });
+
+  describe('email validation', () => {
+    it('should accept valid email', () => {
+      const client = new BlacklistAlliance('test-key');
+      const result = client._validateEmail('test@example.com');
+      assert.strictEqual(result, 'test@example.com');
+    });
+
+    it('should trim whitespace from email', () => {
+      const client = new BlacklistAlliance('test-key');
+      const result = client._validateEmail('  test@example.com  ');
+      assert.strictEqual(result, 'test@example.com');
+    });
+
+    it('should reject email without @', () => {
+      const client = new BlacklistAlliance('test-key');
+      assert.throws(
+        () => client._validateEmail('testexample.com'),
+        /Invalid email format/
+      );
+    });
+
+    it('should reject email without domain', () => {
+      const client = new BlacklistAlliance('test-key');
+      assert.throws(
+        () => client._validateEmail('test@'),
+        /Invalid email format/
+      );
+    });
+
+    it('should reject email without TLD', () => {
+      const client = new BlacklistAlliance('test-key');
+      assert.throws(
+        () => client._validateEmail('test@example'),
+        /Invalid email format/
+      );
+    });
+
+    it('should throw ValidationError for invalid email', () => {
+      const client = new BlacklistAlliance('test-key');
+      assert.throws(
+        () => client._validateEmail('invalid'),
+        (err) => err instanceof ValidationError && err.statusCode === 422
+      );
     });
   });
 
@@ -253,6 +309,51 @@ describe('BlacklistAlliance', () => {
       assert.deepStrictEqual(error.response, { message: 'Invalid key' });
       assert.strictEqual(error.name, 'BlacklistAllianceError');
     });
+
+    it('should create AuthenticationError for 401/403', () => {
+      const error = BlacklistAllianceError.fromResponse('Auth failed', 403, null);
+      assert.strictEqual(error.name, 'AuthenticationError');
+      assert.ok(error instanceof AuthenticationError);
+      assert.ok(error instanceof BlacklistAllianceError);
+    });
+
+    it('should create RateLimitError for 429 with retryAfter', () => {
+      const error = BlacklistAllianceError.fromResponse('Rate limited', 429, null, { retryAfter: 60 });
+      assert.strictEqual(error.name, 'RateLimitError');
+      assert.strictEqual(error.retryAfter, 60);
+      assert.ok(error instanceof RateLimitError);
+    });
+
+    it('should create ValidationError for 400/422', () => {
+      const error = BlacklistAllianceError.fromResponse('Invalid input', 400, null);
+      assert.strictEqual(error.name, 'ValidationError');
+      assert.ok(error instanceof ValidationError);
+    });
+
+    it('should create ServerError for 5xx', () => {
+      const error = BlacklistAllianceError.fromResponse('Server error', 500, null);
+      assert.strictEqual(error.name, 'ServerError');
+      assert.ok(error instanceof ServerError);
+    });
+
+    it('should create TimeoutError', () => {
+      const error = new TimeoutError('Request timeout', null);
+      assert.strictEqual(error.name, 'TimeoutError');
+      assert.strictEqual(error.statusCode, 408);
+    });
+
+    it('should create NetworkError with original error', () => {
+      const originalError = new Error('ECONNRESET');
+      const error = new NetworkError('Connection reset', originalError);
+      assert.strictEqual(error.name, 'NetworkError');
+      assert.strictEqual(error.originalError, originalError);
+    });
+
+    it('should create CircuitBreakerError', () => {
+      const error = new CircuitBreakerError('Circuit open');
+      assert.strictEqual(error.name, 'CircuitBreakerError');
+      assert.strictEqual(error.statusCode, 503);
+    });
   });
 
   describe('retry logic', () => {
@@ -411,6 +512,302 @@ describe('BlacklistAlliance', () => {
         /Internal Server Error/
       );
       assert.strictEqual(attemptCount, 1);
+
+      global.fetch = originalFetch;
+    });
+  });
+
+  describe('request/response hooks', () => {
+    it('should call onRequest hook before request', async () => {
+      let hookCalled = false;
+      let hookedUrl = null;
+      let hookedInfo = null;
+
+      const client = new BlacklistAlliance('test-key', {
+        onRequest: (url, info) => {
+          hookCalled = true;
+          hookedUrl = url;
+          hookedInfo = info;
+        }
+      });
+
+      const originalFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: true,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ status: 'success' }),
+      });
+
+      await client.lookupSingle('1234567890');
+
+      assert.strictEqual(hookCalled, true);
+      assert.ok(hookedUrl.includes('1234567890'));
+      assert.strictEqual(hookedInfo.method, 'GET');
+
+      global.fetch = originalFetch;
+    });
+
+    it('should call onResponse hook after response', async () => {
+      let hookCalled = false;
+      let hookedResponse = null;
+      let hookedData = null;
+
+      const client = new BlacklistAlliance('test-key', {
+        onResponse: (response, data) => {
+          hookCalled = true;
+          hookedResponse = response;
+          hookedData = data;
+        }
+      });
+
+      const originalFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ status: 'success', message: 'Clean' }),
+      });
+
+      await client.lookupSingle('1234567890');
+
+      assert.strictEqual(hookCalled, true);
+      assert.strictEqual(hookedResponse.status, 200);
+      assert.deepStrictEqual(hookedData, { status: 'success', message: 'Clean' });
+
+      global.fetch = originalFetch;
+    });
+
+    it('should support async hooks', async () => {
+      let asyncComplete = false;
+
+      const client = new BlacklistAlliance('test-key', {
+        onRequest: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          asyncComplete = true;
+        }
+      });
+
+      const originalFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: true,
+        headers: { get: () => 'application/json' },
+        json: async () => ({ status: 'success' }),
+      });
+
+      await client.lookupSingle('1234567890');
+      assert.strictEqual(asyncComplete, true);
+
+      global.fetch = originalFetch;
+    });
+  });
+
+  describe('AbortController support', () => {
+    it('should abort request when signal is already aborted', async () => {
+      const client = new BlacklistAlliance('test-key');
+      const controller = new AbortController();
+      controller.abort();
+
+      await assert.rejects(
+        () => client.lookupSingle('1234567890', { signal: controller.signal }),
+        /Request aborted/
+      );
+    });
+
+    it('should abort request when signal fires', async () => {
+      const client = new BlacklistAlliance('test-key', { timeout: 60000 });
+      const controller = new AbortController();
+
+      const originalFetch = global.fetch;
+      global.fetch = async (url, options) => {
+        // Wait for abort or timeout
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            resolve({
+              ok: true,
+              headers: { get: () => 'application/json' },
+              json: async () => ({ status: 'success' }),
+            });
+          }, 200);
+
+          // Listen for abort from the passed signal
+          options.signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            const error = new Error('Aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        });
+      };
+
+      // Abort after 50ms
+      setTimeout(() => controller.abort(), 50);
+
+      await assert.rejects(
+        () => client.lookupSingle('1234567890', { signal: controller.signal }),
+        (err) => err instanceof TimeoutError && err.message === 'Request aborted'
+      );
+
+      global.fetch = originalFetch;
+    });
+
+    it('should NOT retry when user aborts', async () => {
+      const client = new BlacklistAlliance('test-key', { retries: 3 });
+      const controller = new AbortController();
+      let attemptCount = 0;
+
+      const originalFetch = global.fetch;
+      global.fetch = async () => {
+        attemptCount++;
+        // Abort on first attempt
+        controller.abort();
+        // Simulate network abort
+        const error = new Error('Aborted');
+        error.name = 'AbortError';
+        throw error;
+      };
+
+      await assert.rejects(
+        () => client.lookupSingle('1234567890', { signal: controller.signal }),
+        /Request aborted/
+      );
+      assert.strictEqual(attemptCount, 1); // No retries after user abort
+
+      global.fetch = originalFetch;
+    });
+  });
+
+  describe('circuit breaker', () => {
+    it('should open circuit after threshold failures', async () => {
+      const client = new BlacklistAlliance('test-key', {
+        retries: 0,
+        circuitBreaker: { failureThreshold: 3, resetTimeoutMs: 1000 }
+      });
+
+      const originalFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: false,
+        status: 500,
+        statusText: 'Internal Server Error',
+        headers: { get: () => 'application/json' },
+        json: async () => ({ error: 'Server error' }),
+      });
+
+      // First 3 requests should fail normally
+      for (let i = 0; i < 3; i++) {
+        await assert.rejects(() => client.lookupSingle('1234567890'));
+      }
+
+      // 4th request should fail with CircuitBreakerError
+      await assert.rejects(
+        () => client.lookupSingle('1234567890'),
+        (err) => err instanceof CircuitBreakerError
+      );
+
+      global.fetch = originalFetch;
+    });
+
+    it('should transition to HALF_OPEN after cooldown', async () => {
+      const client = new BlacklistAlliance('test-key', {
+        retries: 0,
+        circuitBreaker: { failureThreshold: 2, resetTimeoutMs: 100 }
+      });
+
+      const originalFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: false,
+        status: 500,
+        statusText: 'Error',
+        headers: { get: () => 'application/json' },
+        json: async () => ({}),
+      });
+
+      // Open the circuit
+      await assert.rejects(() => client.lookupSingle('1234567890'));
+      await assert.rejects(() => client.lookupSingle('1234567890'));
+
+      // Should be OPEN now
+      await assert.rejects(
+        () => client.lookupSingle('1234567890'),
+        (err) => err instanceof CircuitBreakerError
+      );
+
+      // Wait for cooldown
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // Should allow request (HALF_OPEN)
+      await assert.rejects(() => client.lookupSingle('1234567890'));
+
+      global.fetch = originalFetch;
+    });
+
+    it('should close circuit on HALF_OPEN success', async () => {
+      const client = new BlacklistAlliance('test-key', {
+        retries: 0,
+        circuitBreaker: { failureThreshold: 2, resetTimeoutMs: 100 }
+      });
+
+      let requestCount = 0;
+      const originalFetch = global.fetch;
+      global.fetch = async () => {
+        requestCount++;
+        if (requestCount <= 2) {
+          return {
+            ok: false,
+            status: 500,
+            statusText: 'Error',
+            headers: { get: () => 'application/json' },
+            json: async () => ({}),
+          };
+        }
+        return {
+          ok: true,
+          headers: { get: () => 'application/json' },
+          json: async () => ({ status: 'success' }),
+        };
+      };
+
+      // Open circuit
+      await assert.rejects(() => client.lookupSingle('1234567890'));
+      await assert.rejects(() => client.lookupSingle('1234567890'));
+
+      // Wait for HALF_OPEN
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // This should succeed and close the circuit
+      const result = await client.lookupSingle('1234567890');
+      assert.strictEqual(result.status, 'success');
+
+      // Next request should work (circuit is CLOSED)
+      await client.lookupSingle('1234567890');
+
+      global.fetch = originalFetch;
+    });
+
+    it('should call onStateChange hook', async () => {
+      const states = [];
+      const client = new BlacklistAlliance('test-key', {
+        retries: 0,
+        circuitBreaker: {
+          failureThreshold: 2,
+          resetTimeoutMs: 50,
+          onStateChange: (state) => states.push(state)
+        }
+      });
+
+      const originalFetch = global.fetch;
+      global.fetch = async () => ({
+        ok: false,
+        status: 500,
+        statusText: 'Error',
+        headers: { get: () => 'application/json' },
+        json: async () => ({}),
+      });
+
+      // Trigger state changes
+      await assert.rejects(() => client.lookupSingle('1234567890'));
+      await assert.rejects(() => client.lookupSingle('1234567890'));
+
+      assert.ok(states.includes('OPEN'));
 
       global.fetch = originalFetch;
     });

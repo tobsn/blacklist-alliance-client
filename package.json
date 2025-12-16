@@ -1,13 +1,15 @@
 {
   "name": "blacklist-alliance-client",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Unofficial Node.js client for the Blacklist Alliance API - phone and email blacklist lookup",
   "main": "src/index.js",
+  "module": "src/index.mjs",
   "types": "src/index.d.ts",
   "exports": {
     ".": {
       "types": "./src/index.d.ts",
-      "default": "./src/index.js"
+      "import": "./src/index.mjs",
+      "require": "./src/index.js"
     }
   },
   "files": [
