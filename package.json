@@ -1,0 +1,43 @@
+{
+  "name": "blacklist-alliance-client",
+  "version": "1.0.0",
+  "description": "Unofficial Node.js client for the Blacklist Alliance API - phone and email blacklist lookup",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "blacklist",
+    "phone",
+    "email",
+    "tcpa",
+    "compliance",
+    "dnc",
+    "do-not-call",
+    "litigator",
+    "blacklist alliance"
+  ],
+  "author": "Tobsn",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tobsn/blacklist-alliance-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tobsn/blacklist-alliance-client/issues"
+  },
+  "homepage": "https://github.com/tobsn/blacklist-alliance-client#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
