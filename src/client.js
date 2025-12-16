@@ -17,13 +17,20 @@ const BASE_URL = "https://api.blacklistalliance.net";
  */
 
 /**
+ * @typedef {Object} OcnInfo
+ * @property {boolean} is_voip - Whether the number is VoIP
+ * @property {string} carrier - Carrier name
+ * @property {string} line_type - e.g., 'mobile', 'landline'
+ */
+
+/**
  * @typedef {Object} CarrierInfo
- * @property {string} did
- * @property {string} type - e.g., 'PCS'
- * @property {string} name - Carrier name
+ * @property {string} did - Phone number
+ * @property {string} type - e.g., 'WIRELESS', 'LANDLINE'
+ * @property {string} name - Carrier name (e.g., 'AT&T')
  * @property {string} state - State code
  * @property {string} ratecenter
- * @property {string} country - Country code
+ * @property {string} country - Country code (e.g., 'US')
  * @property {string} clli
  * @property {string|number} lata
  * @property {string} wireless - 'Y' or 'N'
@@ -32,22 +39,24 @@ const BASE_URL = "https://api.blacklistalliance.net";
  * @property {string|number} nxx
  * @property {string|number} nxxx
  * @property {string|number} ocn
- * @property {string} port_type
+ * @property {string} [port_type]
+ * @property {OcnInfo} [ocn_info] - OCN info (in bulk results)
  */
 
 /**
  * @typedef {Object} SingleLookupResult
  * @property {string} sid - Session ID
  * @property {string} status - 'success' or error status
- * @property {string} message - e.g., 'Blacklisted', 'Clean'
- * @property {string} code - Blacklist codes (e.g., 'prelitigation1,federal-dnc')
+ * @property {string} message - 'Good' for clean, 'Blacklisted' for flagged
+ * @property {string} code - 'none' or comma-separated blacklist codes
  * @property {number} offset
- * @property {number} wireless - 0 or 1
+ * @property {number} wireless - 0 for landline, 1 for wireless
  * @property {string} phone
- * @property {number} results
+ * @property {number} results - 0 for clean, 1 for blacklisted
  * @property {number} time
- * @property {string} scrubs
- * @property {CarrierInfo} [carrier] - Present in v3+
+ * @property {boolean} scrubs
+ * @property {CarrierInfo} [carrier] - Carrier info (v3+)
+ * @property {OcnInfo} [ocn_info] - OCN info (v5)
  */
 
 /**
@@ -55,17 +64,17 @@ const BASE_URL = "https://api.blacklistalliance.net";
  * @property {string} status
  * @property {number} numbers - Total numbers submitted
  * @property {number} count - Numbers processed
- * @property {string[]} phones - All submitted phones
- * @property {string[]} supression - Blacklisted phones (suppression list)
+ * @property {string[]} phones - Clean (not blacklisted) phone numbers
+ * @property {string[]} supression - Blacklisted phones (note: API spelling)
  * @property {string[]} wireless - Wireless numbers
- * @property {Object<string, string>} reasons - Phone to reason codes mapping
- * @property {Object<string, CarrierInfo>} carrier - Phone to carrier info mapping
+ * @property {Object<string, string>} reasons - Blacklisted phone to reason codes
+ * @property {Object<string, CarrierInfo>} carrier - Phone to carrier info
  */
 
 /**
  * @typedef {Object} EmailBulkResult
- * @property {string[]} [good] - Emails not on blacklist
- * @property {string[]} [bad] - Emails on blacklist
+ * @property {string[]} good - Emails not on blacklist (from API)
+ * @property {string[]} bad - Emails on blacklist (computed: submitted - good)
  */
 
 /**
@@ -340,14 +349,14 @@ class BlacklistAlliance {
 			return {
 				sid: "dry-run",
 				status: "success",
-				message: "Clean",
-				code: "",
+				message: "Good",
+				code: "none",
 				offset: 0,
 				wireless: 0,
 				phone: "0000000000",
-				results: 1,
+				results: 0,
 				time: 0,
-				scrubs: "",
+				scrubs: true,
 			};
 		}
 		if (url.includes("bulk") || url.includes("bulklookup")) {

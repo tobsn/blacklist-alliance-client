@@ -3,6 +3,13 @@ export type ResponseFormat = 'json' | 'raw';
 export type StandardResponseFormat = 'json' | 'raw' | 'xml';
 export type BulkResponseFormat = 'json' | 'phonecode';
 
+/** OCN (Operating Company Number) information */
+export interface OcnInfo {
+  is_voip: boolean;
+  carrier: string;
+  line_type: string;
+}
+
 export interface CarrierInfo {
   did: string;
   type: string;
@@ -18,32 +25,46 @@ export interface CarrierInfo {
   nxx: string | number;
   nxxx: string | number;
   ocn: string | number;
-  port_type: string;
+  port_type?: string;
+  ocn_info?: OcnInfo;
 }
 
 export interface SingleLookupResult {
   sid: string;
   status: string;
+  /** "Good" for clean, "Blacklisted" for flagged */
   message: string;
+  /** "none" or comma-separated blacklist codes */
   code: string;
   offset: number;
+  /** 0 for landline, 1 for wireless */
   wireless: number;
   phone: string;
+  /** 0 for clean, 1 for blacklisted */
   results: number;
   time: number;
-  scrubs: string;
+  scrubs: boolean;
+  /** Carrier info (available in v3+) */
   carrier?: CarrierInfo;
+  /** OCN info (available in v5) */
+  ocn_info?: OcnInfo;
 }
 
 export interface BulkLookupResult {
   status: string;
+  /** Total numbers submitted */
   numbers: number;
+  /** Numbers processed */
   count: number;
+  /** Clean (not blacklisted) phone numbers */
   phones: string[];
   /** Blacklisted phone numbers. Note: API uses the spelling "supression" (not "suppression"). */
   supression: string[];
+  /** Wireless phone numbers */
   wireless: string[];
+  /** Map of blacklisted phone to reason codes */
   reasons: Record<string, string>;
+  /** Map of phone to carrier info */
   carrier: Record<string, CarrierInfo>;
 }
 

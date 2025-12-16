@@ -104,7 +104,7 @@ const result = await client.lookupSingle('2223334444');
 {
   sid: '3fa85f64-5717-4562-b3fc-2c963f66afa6',
   status: 'success',
-  message: 'Blacklisted',           // or 'Clean'
+  message: 'Blacklisted',           // or 'Good'
   code: 'prelitigation1,federal-dnc', // blacklist reason codes
   phone: '2223334444',
   wireless: 0,
