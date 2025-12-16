@@ -577,7 +577,7 @@ class BlacklistAlliance {
 	 */
 	async isBlacklisted(phone) {
 		const result = await this.lookupSingle(phone);
-		return result.message === "Blacklisted" || result.supression?.length > 0;
+		return result.message === "Blacklisted";
 	}
 
 	/**
