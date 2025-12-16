@@ -289,14 +289,16 @@ describe('BlacklistAlliance', () => {
 
     it('should merge email results correctly', () => {
       const client = new BlacklistAlliance('test-key');
+      // API only returns "good" - we compute "bad" as submitted minus good
       const results = [
-        { good: ['a@test.com'], bad: ['b@test.com'] },
-        { good: ['c@test.com'], bad: ['d@test.com'] },
+        { good: ['a@test.com', 'c@test.com'] },
+        { good: ['e@test.com'] },
       ];
+      const submittedEmails = ['a@test.com', 'b@test.com', 'c@test.com', 'd@test.com', 'e@test.com'];
 
-      const merged = client._mergeEmailResults(results);
+      const merged = client._mergeEmailResults(results, submittedEmails);
 
-      assert.deepStrictEqual(merged.good, ['a@test.com', 'c@test.com']);
+      assert.deepStrictEqual(merged.good, ['a@test.com', 'c@test.com', 'e@test.com']);
       assert.deepStrictEqual(merged.bad, ['b@test.com', 'd@test.com']);
     });
   });

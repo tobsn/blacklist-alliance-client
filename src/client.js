@@ -577,10 +577,23 @@ class BlacklistAlliance {
 	}
 
 	/**
+	 * Compute "bad" emails as submitted minus "good" (API only returns good)
+	 * @private
+	 */
+	_computeBadEmails(result, submittedEmails) {
+		const goodSet = new Set((result.good || []).map(e => e.toLowerCase()));
+		const bad = submittedEmails.filter(e => !goodSet.has(e.toLowerCase()));
+		return {
+			good: result.good || [],
+			bad: bad,
+		};
+	}
+
+	/**
 	 * Merge multiple email bulk results into one
 	 * @private
 	 */
-	_mergeEmailResults(results) {
+	_mergeEmailResults(results, submittedEmails) {
 		const merged = {
 			good: [],
 			bad: [],
@@ -588,8 +601,11 @@ class BlacklistAlliance {
 
 		for (const r of results) {
 			if (r.good) merged.good.push(...r.good);
-			if (r.bad) merged.bad.push(...r.bad);
 		}
+
+		// Compute "bad" as submitted minus all "good" (API only returns good)
+		const goodSet = new Set(merged.good.map(e => e.toLowerCase()));
+		merged.bad = submittedEmails.filter(e => !goodSet.has(e.toLowerCase()));
 
 		return merged;
 	}
@@ -749,7 +765,8 @@ class BlacklistAlliance {
 			if (options.onProgress) {
 				options.onProgress({ completed: processedEmails.length, total: processedEmails.length, batch: 1, totalBatches: 1 });
 			}
-			return result;
+			// Compute "bad" as submitted minus "good" (API only returns good)
+			return this._computeBadEmails(result, processedEmails);
 		}
 
 		// Multiple batches - execute sequentially and merge
@@ -769,7 +786,7 @@ class BlacklistAlliance {
 			}
 		}
 
-		return this._mergeEmailResults(results);
+		return this._mergeEmailResults(results, processedEmails);
 	}
 
 	// ============================================
@@ -895,8 +912,9 @@ class BlacklistAlliance {
 	async isEmailBlacklisted(email, options = {}) {
 		const emailToCheck = options.hashEmail ? this._hashEmail(email) : email;
 		const result = await this.emailBulk([emailToCheck], { hashEmails: false });
-		// Only the 'bad' list is a definitive indicator of a blacklisted email
-		return result.bad?.includes(emailToCheck) ?? false;
+		// Check if email is in "bad" list (case-insensitive)
+		const badLower = (result.bad || []).map(e => e.toLowerCase());
+		return badLower.includes(emailToCheck.toLowerCase());
 	}
 
 	/**

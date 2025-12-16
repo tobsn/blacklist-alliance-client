@@ -48,8 +48,10 @@ export interface BulkLookupResult {
 }
 
 export interface EmailBulkResult {
-  good?: string[];
-  bad?: string[];
+  /** Emails that are NOT blacklisted (returned by API) */
+  good: string[];
+  /** Emails that ARE blacklisted (computed: submitted minus good) */
+  bad: string[];
 }
 
 export interface Logger {
