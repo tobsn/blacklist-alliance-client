@@ -36,10 +36,12 @@ async function main() {
   // Example 2: Bulk phone lookup
   console.log('\n--- Bulk Phone Lookup ---');
   try {
-    const result = await client.bulkLookupSimple(['2223334444', '5556667777']);
+    // 2223334444 = clean, 9999999999 = blacklisted
+    const result = await client.bulkLookupSimple(['2223334444', '9999999999']);
     console.log('Total checked:', result.numbers);
+    console.log('Clean phones:', result.phones);
     console.log('Blacklisted:', result.supression);
-    console.log('Wireless:', result.wireless);
+    console.log('Reasons:', result.reasons);
   } catch (error) {
     console.error('Error:', error.message);
   }
@@ -47,7 +49,7 @@ async function main() {
   // Example 3: Email blacklist check
   console.log('\n--- Email Blacklist Check ---');
   try {
-    const result = await client.emailBulk(['test@example.com']);
+    const result = await client.emailBulk(['test@example.com', 'test@test.com']);
     console.log('Clean emails:', result.good);
     console.log('Blacklisted:', result.bad);
   } catch (error) {
