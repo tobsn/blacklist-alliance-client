@@ -345,6 +345,15 @@ class BlacklistAlliance {
 	 */
 	_getDryRunResponse(url, options) {
 		// Determine response type based on URL
+		// Note: Check emailbulk BEFORE bulk (since "emailbulk" contains "bulk")
+		if (url.includes("emailbulk")) {
+			const body = options.body ? JSON.parse(options.body) : {};
+			const emails = body.emails || [];
+			return {
+				good: emails,
+				bad: [],
+			};
+		}
 		if (url.includes("/lookup") && !url.includes("bulk")) {
 			return {
 				sid: "dry-run",
@@ -371,14 +380,6 @@ class BlacklistAlliance {
 				wireless: [],
 				reasons: {},
 				carrier: {},
-			};
-		}
-		if (url.includes("emailbulk")) {
-			const body = options.body ? JSON.parse(options.body) : {};
-			const emails = body.emails || [];
-			return {
-				good: emails,
-				bad: [],
 			};
 		}
 		return { status: "success", dryRun: true };
